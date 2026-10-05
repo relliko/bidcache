@@ -1,15 +1,22 @@
 --[[
 * bidcache
 *
-* Remembers the last price you entered in the auction house's bid box and writes it straight back
-* into the box the next time it opens, so you can press Enter at once instead of building the
-* number up from 0 with the arrows again.
+* Remembers what you last bid on each item at the auction house, singles and stacks apart, and
+* writes it straight back into the bid box the next time you bid on that item, so you can press
+* Enter at once instead of building the number up from 0 with the arrows again. Items you haven't
+* bid on yet open at 0 as usual.
 *
-* - The price comes from the auction house's reply to a bid (incoming packet 0x04C, command 0x0E),
-*   which echoes the price you entered, whether the bid won or not.
+* - Prices come from the auction house's reply to a bid (incoming packet 0x04C, command 0x0E),
+*   which echoes the price you entered, the item and the quantity, whether the bid won or not.
 * - The box is the game's 'moneyctr' menu, and its number sits at +40 in the object a pointer at
-*   +12 of the menu points to. That's the default; if a client update moves it, bidcache finds it
-*   again by itself from your bids (see core.narrow), with no keys pressed.
+*   +12 of the menu points to. That's the default.
+* - Which item (and whether a stack) the box is for is read from the game's memory too. Where the
+*   game keeps those is found from your bids, the same way: every place in the box's memory (and
+*   the menu it was opened from) that held the item you bid on is a candidate, and bids on
+*   different items narrow it to one. Until then the game's selected item is used, once a bid has
+*   shown it matches. Not knowing whether it's a stack, only a single's price is ever filled.
+* - Every bid checks all of these places. One that doesn't match stops being used, and a second
+*   miss makes bidcache find it again from your next bids (a client update may move them).
 * - The same box is used for other amounts (trading gil, setting prices), so it is only filled at
 *   the auction house: after the auction house has sent something since every menu was last
 *   closed, and, once a bid has shown which menu you bid from, only when opened from that menu.
@@ -21,8 +28,8 @@
 
 addon.name    = 'bidcache';
 addon.author  = 'Relli';
-addon.version = '0.3';
-addon.desc    = 'Puts your last auction house bid price back in the bid box.';
+addon.version = '0.4';
+addon.desc    = 'Puts your last auction house bid price for each item back in the bid box.';
 addon.link    = 'https://github.com/relliko/bidcache';
 
 require('common');
@@ -34,9 +41,12 @@ local safemem  = require('safemem');
 local defaults = T{
     enabled = true,
     menus = T{ 'moneyctr' }, -- the bid box's menu name(s); learned from a bid if empty
-    place = 'v@12|40',       -- where the box keeps its number ('<region>|<offset>'); relearned if it moves
+    place = 'v@12|40',       -- where the box keeps its number ('<region>|<offset>')
+    item_place = '',         -- where the game keeps the item the box is for; learned
+    qty_place = '',          -- where it keeps the quantity (1, or the stack size); learned
+    sel_ok = false,          -- the game's selected item matched the last bid's item
     parents = T{},           -- menus the bid box has been opened from; learned from your bids
-    last_price = 0,
+    prices = T{},            -- see core.record
     debug = false,           -- print menu changes and what learning finds
 };
 
@@ -44,19 +54,34 @@ local OBJ_SIZE, HDR_SIZE, CHILD_SIZE, MAX_CHILDREN = 0x400, 0x200, 0x100, 64;
 local RECENT = 5;        -- seconds a closed menu's copy is kept for matching a bid reply
 local AH_CLOSE_WAIT = 1; -- seconds with no menu open before the auction house counts as left
 
+-- The places learned from bids: the setting each is saved in, its width in bytes, and what it's called.
+local PLACES = {
+    { key = 'item_place', width = 2, what = 'which item the bid box is for' },
+    { key = 'qty_place',  width = 1, what = 'whether the bid box is for a stack' },
+};
+
 local ap = {
     settings = settings.load(defaults),
     menu = '', obj = 0, hdr = 0,
     snap = nil,       -- copy of the open menu, see core.find
     closed = {},      -- { name, snap, t } of recently closed menus, newest first
-    learn = {},       -- see core.narrow
-    misses = 0,       -- bid replies the place didn't match
-    fill = nil,       -- { polls, writes } while writing the price into the box
+    learn = {},       -- see core.narrow, for the box's number
+    misses = 0,       -- bid replies the box's place didn't match
+    places = {},      -- [key] = { learn, misses } for each of PLACES
+    fill = nil,       -- { polls, writes, price } while writing the price into the box
     at_ah = false,    -- the auction house has sent something since every menu was last closed
     no_menu_since = nil,
-    parent = '',      -- the menu open before the current one
+    parent = '', parent_obj = 0, parent_hdr = 0, -- the menu open before the current one
     box_parent = nil, -- the menu the bid box was last opened from
+    box_psnap = nil,  -- a copy of it, taken as the box opened
 };
+
+local function reset_places()
+    for _, p in ipairs(PLACES) do
+        ap.places[p.key] = { learn = {}, misses = 0 };
+    end
+end
+reset_places();
 
 local function msg(text)
     print(chat.header(addon.name):append(chat.message(text)));
@@ -65,6 +90,11 @@ end
 local function gil(n)
     local s = tostring(n):reverse():gsub('(%d%d%d)', '%1,'):reverse();
     return (s:gsub('^,', '')) .. ' gil';
+end
+
+local function item_name(id)
+    local item = AshitaCore:GetResourceManager():GetItemById(id);
+    return (item ~= nil and item.Name[1] ~= nil and item.Name[1] ~= '') and item.Name[1] or ('item ' .. tostring(id));
 end
 
 local function listed(list, name)
@@ -108,22 +138,23 @@ local function looks_like_ptr(p)
     return p >= 0x00400000 and p < 0x7FFF0000 and p % 4 == 0;
 end
 
--- A copy of the menu object, its header, and what the object's pointers point to.
-local function snapshot(obj, hdr)
-    local snap = {};
-    local o = safemem.read(obj, OBJ_SIZE);
+-- A copy of a menu object, its header, and what the object's pointers point to; regions get prefix.
+local function snapshot(obj, hdr, prefix, into)
+    local snap = into or {};
+    prefix = prefix or '';
+    local o = obj ~= 0 and safemem.read(obj, OBJ_SIZE) or nil;
     if (o == nil) then
         return nil;
     end
-    snap.v = o;
-    snap.h = safemem.read(hdr, HDR_SIZE);
+    snap[prefix .. 'v'] = o;
+    snap[prefix .. 'h'] = safemem.read(hdr, HDR_SIZE);
     local n = 0;
     for off = 8, OBJ_SIZE - 4, 4 do
         local p = core.u32(o, off);
         if (looks_like_ptr(p) and p ~= hdr and p ~= obj) then
             local c = safemem.read(p, CHILD_SIZE);
             if (c ~= nil) then
-                snap['v@' .. off] = c;
+                snap[prefix .. 'v@' .. off] = c;
                 n = n + 1;
                 if (n >= MAX_CHILDREN) then
                     break;
@@ -134,15 +165,22 @@ local function snapshot(obj, hdr)
     return snap;
 end
 
--- The address of a place in the open menu, or nil.
-local function resolve(place, obj, hdr)
+-- The address of a place in the open bid box ('p:' places: in the menu it was opened from), or nil.
+local function resolve(place)
     local region, off = core.parse(place);
+    if (region == nil) then
+        return nil;
+    end
+    local obj, hdr = ap.obj, ap.hdr;
+    if (region:sub(1, 2) == 'p:') then
+        region, obj, hdr = region:sub(3), ap.parent_obj, ap.parent_hdr;
+    end
     if (region == 'v') then
         return obj + off;
     elseif (region == 'h') then
         return hdr + off;
     end
-    local poff = region ~= nil and tonumber(region:match('^v@(%d+)$'));
+    local poff = tonumber(region:match('^v@(%d+)$') or '');
     local p = poff ~= nil and safemem.u32(obj + poff) or nil;
     if (p == nil or not looks_like_ptr(p)) then
         return nil;
@@ -150,12 +188,48 @@ local function resolve(place, obj, hdr)
     return p + off;
 end
 
--- The bid box just opened: fill it if it's the auction house's.
+-- The width-byte value at a place, or nil.
+local function read_place(place, width)
+    local addr = place ~= '' and resolve(place) or nil;
+    local s = addr ~= nil and safemem.read(addr, width) or nil;
+    return s ~= nil and core.value(s, 0, width) or nil;
+end
+
+-- A learned place that's usable now (found, and not missed since), or nil.
+local function usable(key)
+    local place = ap.settings[key];
+    return (place ~= '' and ap.places[key].misses == 0) and place or nil;
+end
+
+-- The item the open box is for, and whether it's a stack (nil when not known).
+local function box_item()
+    local s = ap.settings;
+    local id = nil;
+    local ip = usable('item_place');
+    if (ip ~= nil) then
+        id = read_place(ip, 2);
+    elseif (s.sel_ok) then
+        id = AshitaCore:GetMemoryManager():GetInventory():GetSelectedItemId();
+    end
+    if (id == nil or id == 0 or id == 0xFFFF) then
+        return nil, nil;
+    end
+    local stack = nil;
+    local qp = usable('qty_place');
+    local q = qp ~= nil and read_place(qp, 1) or nil;
+    if (q ~= nil and q >= 1) then
+        stack = q > 1;
+    end
+    return id, stack;
+end
+
+-- The bid box just opened: fill it if it's the auction house's and you've bid on the item before.
 local function on_open()
     local s = ap.settings;
     ap.box_parent = ap.parent;
-    -- After a bid that didn't match the place, nothing is written until it's confirmed or found again.
-    if (not core.valid_price(s.last_price) or s.place == '' or not ap.at_ah or ap.misses > 0) then
+    ap.box_psnap = snapshot(ap.parent_obj, ap.parent_hdr, 'p:');
+    -- After a bid that didn't match the box's place, nothing is written until it's found again.
+    if (s.place == '' or not ap.at_ah or ap.misses > 0) then
         return;
     end
     if (#s.parents > 0 and not listed(s.parents, ap.parent)) then
@@ -164,7 +238,16 @@ local function on_open()
         end
         return;
     end
-    ap.fill = { polls = 0, writes = 0 };
+    local id, stack = box_item();
+    local price = id ~= nil and core.lookup(s.prices, id, stack) or nil;
+    if (s.debug) then
+        local kind = stack == true and 'stack' or stack == false and 'single' or 'single or stack';
+        msg(('Box for %s (%s): %s.'):fmt(id ~= nil and item_name(id) or 'an unknown item', kind,
+            price ~= nil and gil(price) or 'no price to fill'));
+    end
+    if (price ~= nil) then
+        ap.fill = { polls = 0, writes = 0, price = price };
+    end
 end
 
 -- Writes the price into the open box while it still reads 0 (the box may zero itself as it opens).
@@ -174,26 +257,49 @@ local function fill_step()
     if (f.polls < 2) then
         return;
     end
-    local addr = resolve(s.place, ap.obj, ap.hdr);
+    local addr = resolve(s.place);
     local cur = addr ~= nil and safemem.u32(addr) or nil;
     if (cur == 0 and f.writes < 3) then
-        ashita.memory.write_uint32(addr, s.last_price);
+        ashita.memory.write_uint32(addr, f.price);
         f.writes = f.writes + 1;
-    elseif (cur == s.last_price and f.writes > 0) then
-        if (s.debug) then
-            msg(('Set the box to %s.'):fmt(gil(s.last_price)));
-        end
-        ap.fill = nil;
     else
-        -- Gone, or holding something else (you changed it): leave it alone.
+        -- Done, gone, or holding something else (you changed it): leave it alone.
         ap.fill = nil;
     end
 end
 
--- A bid reply: remember the price, and check the bid box's last copy still keeps it at the place.
-local function on_bid(price)
+-- Checks a learned place against a bid, or learns it from the bid when it isn't known.
+local function check_place(p, found, value)
+    local s, st = ap.settings, ap.places[p.key];
+    if (s[p.key] == '') then
+        local place = core.narrow(st.learn, found, value);
+        if (s.debug) then
+            msg(('Learning %s: %d place(s) still match.'):fmt(p.what, core.count(st.learn.cands)));
+        end
+        if (place ~= nil) then
+            s[p.key], st.misses = place, 0;
+            msg(('Found %s.'):fmt(p.what));
+        end
+    elseif (found[s[p.key]]) then
+        st.misses = 0;
+    else
+        st.misses = st.misses + 1;
+        if (st.misses >= 2) then
+            s[p.key], st.learn, st.misses = '', {}, 0;
+            msg(('Lost track of %s; your next bids will find it again.'):fmt(p.what));
+        end
+    end
+end
+
+-- A bid reply: remember the price, and check (or learn) where the game keeps the box's values.
+local function on_bid(price, id, qty)
     local s = ap.settings;
-    s.last_price = price;
+    local stack = qty > 1;
+    core.record(s.prices, id, stack, price);
+    s.sel_ok = AshitaCore:GetMemoryManager():GetInventory():GetSelectedItemId() == id;
+    if (s.debug) then
+        msg(('Bid %s on %s%s.'):fmt(gil(price), item_name(id), stack and (' (stack of %d)'):fmt(qty) or ''));
+    end
 
     local now, entry, found = os.clock(), nil, nil;
     for _, c in ipairs(ap.closed) do
@@ -207,7 +313,7 @@ local function on_bid(price)
     end
     if (entry == nil) then
         if (s.debug) then
-            msg(('Bid of %s: no recent menu held that number.'):fmt(gil(price)));
+            msg('No recent menu held that price.');
         end
         if (#s.menus > 0) then
             -- The bid box may have been renamed too (a client update): look at every menu again.
@@ -224,19 +330,15 @@ local function on_bid(price)
         table.insert(s.menus, entry.name);
         msg(('Found the bid box ("%s").'):fmt(entry.name));
     end
-    if (ap.box_parent ~= nil and ap.box_parent ~= '' and not listed(s.parents, ap.box_parent)) then
-        table.insert(s.parents, ap.box_parent);
+    if (entry.parent ~= nil and entry.parent ~= '' and not listed(s.parents, entry.parent)) then
+        table.insert(s.parents, entry.parent);
     end
 
     if (s.place == '') then
         local place = core.narrow(ap.learn, found, price);
-        if (s.debug) then
-            msg(('Bid of %s: %d place(s) in "%s" still match.'):fmt(gil(price), core.count(ap.learn.cands), entry.name));
-        end
         if (place ~= nil) then
-            s.place = place;
-            ap.misses = 0;
-            msg('Found where the bid box keeps its number again: it fills in as the box opens.');
+            s.place, ap.misses = place, 0;
+            msg('Found where the bid box keeps its number again.');
         end
     elseif (found[s.place]) then
         ap.misses = 0;
@@ -247,6 +349,13 @@ local function on_bid(price)
             msg('The bid box\'s number has moved (a client update?); your next two bids at different prices will find it.');
         end
     end
+
+    -- The item and quantity can be in the box or in the menu it was opened from.
+    local both = {};
+    for k, v in pairs(entry.snap) do both[k] = v; end
+    for k, v in pairs(entry.psnap or {}) do both[k] = v; end
+    check_place(PLACES[1], core.find(both, id, 2), id);
+    check_place(PLACES[2], core.find(both, qty, 1), qty);
     settings.save();
 end
 
@@ -259,25 +368,28 @@ settings.register('settings', 'bidcache_settings_update', function (s)
         ap.settings = s;
     end
     ap.learn, ap.misses = {}, 0;
+    reset_places();
 end);
 
 --[[
 * event: packet_in
 * desc : 0x04C is the auction house's reply, also sent as it opens. For a bid (command 0x0E) it
-*        echoes the price you entered at 0x08, whether you won (result 0x01) or were outbid.
-*        Read only.
+*        echoes the price you entered at 0x08, the item at 0x0C, and 1 at 0x10 for a single or the
+*        stack size for a stack, whether you won (result 0x01) or were outbid. Read only.
 --]]
 ashita.events.register('packet_in', 'bidcache_packet_in', function (e)
     if (e.id ~= 0x04C) then
         return;
     end
     ap.at_ah = true;
-    if (e.size < 0x0C or e.data:byte(0x04 + 1) ~= 0x0E) then
+    if (e.size < 0x14 or e.data:byte(0x04 + 1) ~= 0x0E) then
         return;
     end
     local price = struct.unpack('I4', e.data, 0x08 + 1);
-    if (core.valid_price(price)) then
-        on_bid(price);
+    local id = struct.unpack('H', e.data, 0x0C + 1);
+    local qty = struct.unpack('I4', e.data, 0x10 + 1);
+    if (core.valid_price(price) and id > 0 and id < 0xFFFF and qty >= 1 and qty <= 99) then
+        on_bid(price, id, qty);
     end
 end);
 
@@ -291,14 +403,15 @@ ashita.events.register('d3d_present', 'bidcache_present', function ()
     local changed = name ~= ap.menu or obj ~= ap.obj;
     if (changed) then
         if (ap.menu ~= '' and ap.snap ~= nil) then
-            table.insert(ap.closed, 1, { name = ap.menu, snap = ap.snap, t = os.clock() });
+            table.insert(ap.closed, 1, { name = ap.menu, snap = ap.snap, psnap = ap.box_psnap,
+                parent = ap.box_parent, t = os.clock() });
             ap.closed[5] = nil;
         end
         if (ap.menu ~= '' and ap.menu ~= name) then
-            ap.parent = ap.menu;
+            ap.parent, ap.parent_obj, ap.parent_hdr = ap.menu, ap.obj, ap.hdr;
         end
         ap.menu, ap.obj, ap.hdr = name, obj, hdr;
-        ap.snap, ap.fill = nil, nil;
+        ap.snap, ap.fill, ap.box_psnap, ap.box_parent = nil, nil, nil, nil;
         if (s.debug) then
             msg(('Menu "%s" (from "%s")%s.'):fmt(name, ap.parent, ap.at_ah and ', at the auction house' or ''));
         end
@@ -306,7 +419,7 @@ ashita.events.register('d3d_present', 'bidcache_present', function ()
     if (name == '') then
         ap.no_menu_since = ap.no_menu_since or os.clock();
         if (os.clock() - ap.no_menu_since >= AH_CLOSE_WAIT) then
-            ap.at_ah, ap.parent = false, '';
+            ap.at_ah, ap.parent, ap.parent_obj, ap.parent_hdr = false, '', 0, 0;
         end
         return;
     end
@@ -345,25 +458,47 @@ ashita.events.register('command', 'bidcache_command', function (e)
         s.debug = (v == '') and not s.debug or v == 'on';
         settings.save();
         msg(('Debug %s.'):fmt(s.debug and 'on' or 'off'));
-    elseif (cmd == 'price') then
-        local n = tonumber(args[3] or '');
-        if (not core.valid_price(n)) then
-            msg('/bidcache price <1-999999999>');
-            return;
+    elseif (cmd == 'list') then
+        local n = 0;
+        for key, p in pairs(s.prices) do
+            local id = tonumber(key);
+            if (id ~= nil) then
+                local parts = {};
+                if (p.single ~= nil) then parts[#parts + 1] = gil(p.single); end
+                if (p.stack ~= nil) then parts[#parts + 1] = gil(p.stack) .. ' (stack)'; end
+                msg(('%s: %s'):fmt(item_name(id), table.concat(parts, ', ')));
+                n = n + 1;
+            end
         end
-        s.last_price = n;
-        settings.save();
-        msg(('Next bid box opens at %s.'):fmt(gil(n)));
+        if (n == 0) then
+            msg('No prices saved yet. Bid on something at the auction house first.');
+        end
+    elseif (cmd == 'forget') then
+        local id = tonumber(args[3] or '');
+        if (id == nil and args[3] ~= nil) then
+            local item = AshitaCore:GetResourceManager():GetItemByName(table.concat(args, ' ', 3), 0);
+            id = item ~= nil and item.Id or nil;
+        end
+        if (id ~= nil and core.forget(s.prices, id)) then
+            settings.save();
+            msg(('Forgot the price for %s.'):fmt(item_name(id)));
+        else
+            msg('/bidcache forget <item id or name>');
+        end
     elseif (cmd == 'relearn') then
-        s.menus, s.place, s.parents, ap.learn, ap.misses = T{}, '', T{}, {}, 0;
+        s.menus, s.place, s.parents, s.item_place, s.qty_place, s.sel_ok = T{}, '', T{}, '', '', false;
+        ap.learn, ap.misses = {}, 0;
+        reset_places();
         settings.save();
-        msg('Forgot the bid box; your next two bids at different prices will find it again.');
+        msg('Forgot where everything is; your next bids at the auction house will find it again.');
     else
-        local how = s.place ~= '' and 'fills as it opens' or 'not found: make two bids at different prices';
-        msg(('Last price %s; bid box %s.'):fmt(core.valid_price(s.last_price) and gil(s.last_price) or 'none yet', how));
+        local item = s.item_place ~= '' and 'found' or (s.sel_ok and 'using the selected item' or 'not found yet');
+        msg(('Bid box %s; its item %s; stack or single %s.'):fmt(s.place ~= '' and 'found' or 'not found yet',
+            item, s.qty_place ~= '' and 'found' or 'not found yet'));
         msg('/bidcache on|off            fill the bid box (now ' .. (s.enabled and 'on' or 'off') .. ')');
-        msg('/bidcache price <n>         set the price the box opens at');
-        msg('/bidcache relearn           find the bid box again');
+        msg('/bidcache list              prices saved for each item');
+        msg('/bidcache forget <item>     drop an item\'s prices');
+        msg('/bidcache relearn           find the bid box and its item again');
         msg('/bidcache debug [on|off]    print menu names and what learning finds');
     end
 end);
