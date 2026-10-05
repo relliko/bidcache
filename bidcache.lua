@@ -30,7 +30,7 @@
 --]]
 
 addon.name    = 'bidcache';
-addon.author  = 'Relli';
+addon.author  = 'relli';
 addon.version = '0.6';
 addon.desc    = 'Puts your last auction house bid price back in the bid box when you bid on the same item again.';
 addon.link    = 'https://github.com/relliko/bidcache';
