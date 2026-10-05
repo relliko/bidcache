@@ -23,7 +23,7 @@ addon.name    = 'bidcache';
 addon.author  = 'Relli';
 addon.version = '0.3';
 addon.desc    = 'Puts your last auction house bid price back in the bid box.';
-addon.link    = '';
+addon.link    = 'https://github.com/relliko/bidcache';
 
 require('common');
 local chat     = require('chat');
