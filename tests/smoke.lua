@@ -54,7 +54,7 @@ AshitaCore = {
         GetSelectedItemId = function () return selected end } end } end,
     GetResourceManager = function () return {
         GetItemById = function (_, id) return { Name = { 'Item' .. id } } end,
-        GetItemByName = function (_, name) return name == 'Item17' and { Id = 17 } or nil end } end,
+    } end,
 }
 struct = { unpack = function (fmt, s, pos)
     local n = fmt == 'H' and 2 or 4
@@ -73,7 +73,7 @@ local store = nil
 package.loaded['settings'] = {
     load = function (d)
         store = { enabled = true, menus = { d.menus[1] }, place = d.place, item_place = '', qty_place = '',
-                  sel_ok = false, parents = {}, prices = {}, debug = true }
+                  sel_ok = false, parents = {}, debug = true }
         return store
     end,
     save = function () end, register = function () end }
@@ -110,49 +110,66 @@ local function bid(entered, item, qty)
     return price
 end
 
+local function cmd(c) local e = { command = c } events.command(e) assert(e.blocked, c) end
+
 at_ah()
--- First bid on item 100: nothing saved, so the box opens at 0 and you enter 1200.
+-- First bid on item 100: nothing remembered, so the box opens at 0 and you enter 1200.
 selected = 100
 assert(open_box(100) == 0)
 bid(1200, 100)
-assert(store.prices['100'].single == 1200)
 assert(store.sel_ok and store.parents[1] == 'auclist')
--- Next time on item 100 it already holds 1200 (from the game's selected item, for now).
+assert(store.prices == nil, 'prices must not be saved')
+-- Bidding on item 100 again: it already holds 1200 (from the game's selected item, for now).
 assert(open_box(100) == 1200, 'not filled from the selected item')
 bid(nil, 100)
--- A different item, 200: nothing saved for it, so 0. You bid 500.
+-- A different item, 200: the box opens at 0 and the 1200 is forgotten. You bid 500.
 selected = 200
-assert(open_box(200) == 0, 'filled an item with no saved price')
+assert(open_box(200) == 0, 'filled a different item')
 bid(500, 200)
 assert(store.item_place == 'v@12|44', 'item place not learned: ' .. store.item_place)
 -- Now the item comes from the box's own memory, even if the selected item says otherwise.
 selected = 999
-assert(open_box(100) == 1200, 'item 100 not filled from the box')
-bid(nil, 100)
-assert(open_box(200) == 500)
+assert(open_box(200) == 500, 'item 200 not filled from the box')
 bid(nil, 200)
--- A stack of item 100. Not knowing yet that it's a stack, it gets the single's price (too low for
--- a stack, never too high). You enter 20000.
+-- Back to item 100: 0, and the 500 is gone too, so item 200 is at 0 again as well.
+assert(open_box(100) == 0, 'a big price landed on another item')
+assert(open_box(200) == 0, 'the last bid was not forgotten')
+-- A single of item 100 at 1200, then its stack. Not knowing yet that the box is for a stack, it
+-- gets the single's price (too low for a stack, never too high). You enter 20000.
+open_box(100) bid(1200, 100)
 assert(open_box(100, 12) == 1200)
 bid(20000, 100, 12)
-assert(store.prices['100'].stack == 20000)
 assert(store.qty_place == 'v@12|46', 'quantity place not learned: ' .. store.qty_place)
--- Now singles and stacks each get their own price.
 assert(open_box(100, 12) == 20000, 'stack price not filled')
 bid(nil, 100, 12)
-assert(open_box(100, 1) == 1200, 'single price not filled')
-bid(nil, 100)
+-- The single after the stack is the other kind: 0, so the stack's price can't land on a single.
+assert(open_box(100, 1) == 0, 'stack price landed on a single')
+
+-- /bidcache price: 0 forgets the bid; a price with no bid behind it is for whichever item is next.
+open_box(100) bid(900, 100)
+cmd('/bc price 0')
+assert(open_box(100) == 0, 'price 0 did not forget the bid')
+cmd('/bc price 300')
+assert(open_box(200) == 300, 'set price not filled')
+assert(open_box(100) == 0, 'set price used for a second item')
+cmd('/bc price 99999999')
+assert(open_box(100) == 99999999, 'top price not accepted')
+cmd('/bc price 100000000')
+
 -- A box you've already changed is left alone.
+open_box(100) bid(900, 100)
 show('auclist') frames()
 show('moneyctr', 100, 1)
 w32(num, 7)
 frames()
 assert(r32(num) == 7)
 -- Opened from some other menu (selling from your inventory at the counter): not filled.
+open_box(100) bid(900, 100)
 show('inventor') frames()
 show('moneyctr', 100, 1) frames()
 assert(r32(num) == 0, 'filled a box opened from elsewhere')
 -- Leave the auction house (every menu closed), then trade gil: not filled either.
+open_box(100) bid(900, 100)
 close_all() frames(120)
 assert(open_box(100, 1) == 0, 'filled away from the auction house')
 
@@ -172,13 +189,9 @@ assert(open_box(100) == 1800)
 bid(nil, 100)
 
 local w = writes
-for _, c in ipairs({ '/bidcache', '/bc list', '/bc off', '/bc on', '/bc debug off', '/bc forget Item17',
-                     '/bc forget 100', '/bc forget', '/bc relearn' }) do
-    local e = { command = c }
-    events.command(e)
-    assert(e.blocked, c)
+for _, c in ipairs({ '/bidcache', '/bc off', '/bc on', '/bc debug off', '/bc price x', '/bc relearn' }) do
+    cmd(c)
 end
-assert(store.prices['100'] == nil and store.prices['200'].single == 500)
 assert(store.place == '' and store.item_place == '' and store.qty_place == '' and #store.menus == 0)
 assert(writes == w)
 events.unload()

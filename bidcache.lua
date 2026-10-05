@@ -1,20 +1,22 @@
 --[[
 * bidcache
 *
-* Remembers what you last bid on each item at the auction house, singles and stacks apart, and
-* writes it straight back into the bid box the next time you bid on that item, so you can press
-* Enter at once instead of building the number up from 0 with the arrows again. Items you haven't
-* bid on yet open at 0 as usual.
+* Remembers your last auction house bid and writes its price straight back into the bid box when
+* you bid on the same item again, so you can press Enter at once instead of building the number
+* up from 0 with the arrows again. Opening the box for a different item (or the other kind:
+* single or stack) forgets it, so a big price never lands on a cheap item. It's only kept while
+* the game runs.
 *
-* - Prices come from the auction house's reply to a bid (incoming packet 0x04C, command 0x0E),
-*   which echoes the price you entered, the item and the quantity, whether the bid won or not.
+* - The bid comes from the auction house's reply (incoming packet 0x04C, command 0x0E), which
+*   echoes the price you entered, the item and the quantity, whether the bid won or not.
 * - The box is the game's 'moneyctr' menu, and its number sits at +40 in the object a pointer at
 *   +12 of the menu points to. That's the default.
 * - Which item (and whether a stack) the box is for is read from the game's memory too. Where the
 *   game keeps those is found from your bids, the same way: every place in the box's memory (and
 *   the menu it was opened from) that held the item you bid on is a candidate, and bids on
 *   different items narrow it to one. Until then the game's selected item is used, once a bid has
-*   shown it matches. Not knowing whether it's a stack, only a single's price is ever filled.
+*   shown it matches. A box whose item can't be told is left at 0. Not knowing whether it's a
+*   stack, a stack's price is never filled.
 * - Every bid checks all of these places. One that doesn't match stops being used, and a second
 *   miss makes bidcache find it again from your next bids (a client update may move them).
 * - The same box is used for other amounts (trading gil, setting prices), so it is only filled at
@@ -28,8 +30,8 @@
 
 addon.name    = 'bidcache';
 addon.author  = 'Relli';
-addon.version = '0.4';
-addon.desc    = 'Puts your last auction house bid price for each item back in the bid box.';
+addon.version = '0.5';
+addon.desc    = 'Puts your last auction house bid price back in the bid box when you bid on the same item again.';
 addon.link    = 'https://github.com/relliko/bidcache';
 
 require('common');
@@ -46,7 +48,6 @@ local defaults = T{
     qty_place = '',          -- where it keeps the quantity (1, or the stack size); learned
     sel_ok = false,          -- the game's selected item matched the last bid's item
     parents = T{},           -- menus the bid box has been opened from; learned from your bids
-    prices = T{},            -- see core.record
     debug = false,           -- print menu changes and what learning finds
 };
 
@@ -74,6 +75,7 @@ local ap = {
     parent = '', parent_obj = 0, parent_hdr = 0, -- the menu open before the current one
     box_parent = nil, -- the menu the bid box was last opened from
     box_psnap = nil,  -- a copy of it, taken as the box opened
+    last = nil,       -- your last bid, see core.match; never saved
 };
 
 local function reset_places()
@@ -239,7 +241,12 @@ local function on_open()
         return;
     end
     local id, stack = box_item();
-    local price = id ~= nil and core.lookup(s.prices, id, stack) or nil;
+    local price, wipe = core.match(ap.last, id, stack);
+    if (wipe) then
+        ap.last = nil;
+    elseif (price ~= nil and ap.last.id == nil) then
+        ap.last.id, ap.last.stack = id, stack; -- a price set with /bidcache price is for this item
+    end
     if (s.debug) then
         local kind = stack == true and 'stack' or stack == false and 'single' or 'single or stack';
         msg(('Box for %s (%s): %s.'):fmt(id ~= nil and item_name(id) or 'an unknown item', kind,
@@ -295,7 +302,7 @@ end
 local function on_bid(price, id, qty)
     local s = ap.settings;
     local stack = qty > 1;
-    core.record(s.prices, id, stack, price);
+    ap.last = { id = id, stack = stack, price = price };
     s.sel_ok = AshitaCore:GetMemoryManager():GetInventory():GetSelectedItemId() == id;
     if (s.debug) then
         msg(('Bid %s on %s%s.'):fmt(gil(price), item_name(id), stack and (' (stack of %d)'):fmt(qty) or ''));
@@ -458,32 +465,17 @@ ashita.events.register('command', 'bidcache_command', function (e)
         s.debug = (v == '') and not s.debug or v == 'on';
         settings.save();
         msg(('Debug %s.'):fmt(s.debug and 'on' or 'off'));
-    elseif (cmd == 'list') then
-        local n = 0;
-        for key, p in pairs(s.prices) do
-            local id = tonumber(key);
-            if (id ~= nil) then
-                local parts = {};
-                if (p.single ~= nil) then parts[#parts + 1] = gil(p.single); end
-                if (p.stack ~= nil) then parts[#parts + 1] = gil(p.stack) .. ' (stack)'; end
-                msg(('%s: %s'):fmt(item_name(id), table.concat(parts, ', ')));
-                n = n + 1;
-            end
-        end
+    elseif (cmd == 'price') then
+        local n = tonumber(args[3] or '');
         if (n == 0) then
-            msg('No prices saved yet. Bid on something at the auction house first.');
-        end
-    elseif (cmd == 'forget') then
-        local id = tonumber(args[3] or '');
-        if (id == nil and args[3] ~= nil) then
-            local item = AshitaCore:GetResourceManager():GetItemByName(table.concat(args, ' ', 3), 0);
-            id = item ~= nil and item.Id or nil;
-        end
-        if (id ~= nil and core.forget(s.prices, id)) then
-            settings.save();
-            msg(('Forgot the price for %s.'):fmt(item_name(id)));
+            ap.last = nil;
+            msg('Forgot the last bid: the box opens at 0.');
+        elseif (core.valid_price(n)) then
+            local l = ap.last or {};
+            ap.last = { id = l.id, stack = l.stack, price = n };
+            msg(('The box opens at %s for %s.'):fmt(gil(n), l.id ~= nil and item_name(l.id) or 'the next item you bid on'));
         else
-            msg('/bidcache forget <item id or name>');
+            msg(('/bidcache price <0-%s>   0 forgets the last bid'):fmt((gil(core.MAX_PRICE):gsub(' gil', ''))));
         end
     elseif (cmd == 'relearn') then
         s.menus, s.place, s.parents, s.item_place, s.qty_place, s.sel_ok = T{}, '', T{}, '', '', false;
@@ -495,9 +487,11 @@ ashita.events.register('command', 'bidcache_command', function (e)
         local item = s.item_place ~= '' and 'found' or (s.sel_ok and 'using the selected item' or 'not found yet');
         msg(('Bid box %s; its item %s; stack or single %s.'):fmt(s.place ~= '' and 'found' or 'not found yet',
             item, s.qty_place ~= '' and 'found' or 'not found yet'));
+        local l = ap.last;
+        msg(l == nil and 'No last bid: the box opens at 0.' or ('Last bid %s on %s%s.'):fmt(gil(l.price),
+            l.id ~= nil and item_name(l.id) or 'the next item', l.stack and ' (stack)' or ''));
         msg('/bidcache on|off            fill the bid box (now ' .. (s.enabled and 'on' or 'off') .. ')');
-        msg('/bidcache list              prices saved for each item');
-        msg('/bidcache forget <item>     drop an item\'s prices');
+        msg('/bidcache price <n>         set the price the box opens at (0 forgets it)');
         msg('/bidcache relearn           find the bid box and its item again');
         msg('/bidcache debug [on|off]    print menu names and what learning finds');
     end

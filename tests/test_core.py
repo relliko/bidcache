@@ -63,47 +63,48 @@ class FindTests(unittest.TestCase):
         self.assertEqual((r[1], r[2]), ('v@24', 8))
 
 
-class PriceBookTests(unittest.TestCase):
+class LastBidTests(unittest.TestCase):
     def setUp(self):
         self.lua, self.core = runtime()
-        self.prices = self.lua.eval("{}")
+        self.match = self.lua.eval("function (c, last, id, stack) local p, w = c.match(last, id, stack) return {p, w} end")
 
-    def look(self, id, stack=None):
-        return self.core.lookup(self.prices, id, stack)
+    def last(self, id, stack, price):
+        t = self.lua.eval("{}")
+        t['id'], t['stack'], t['price'] = id, stack, price
+        return t
 
-    def test_single(self):
-        self.assertTrue(self.core.record(self.prices, 4096, False, 1500))
-        self.assertEqual(self.look(4096, False), 1500)
-        self.assertEqual(self.look(4096), 1500)
-        self.assertIsNone(self.look(4096, True))
+    def m(self, last, id, stack=None):
+        r = self.match(self.core, last, id, stack)
+        return r[1], r[2]
 
-    def test_latest_wins(self):
-        self.core.record(self.prices, 4096, False, 1500)
-        self.core.record(self.prices, 4096, False, 1800)
-        self.assertEqual(self.look(4096, False), 1800)
+    def test_same_item(self):
+        self.assertEqual(self.m(self.last(4096, False, 1500), 4096, False), (1500, False))
+        self.assertEqual(self.m(self.last(4096, False, 1500), 4096), (1500, False))
+
+    def test_other_item_wipes(self):
+        self.assertEqual(self.m(self.last(4096, False, 1500), 17), (None, True))
+
+    def test_other_kind_wipes(self):
+        self.assertEqual(self.m(self.last(4096, False, 1500), 4096, True), (None, True))
+        self.assertEqual(self.m(self.last(4096, True, 20000), 4096, False), (None, True))
+        self.assertEqual(self.m(self.last(4096, True, 20000), 4096, True), (20000, False))
 
     def test_stack_price_never_used_when_kind_unknown(self):
-        self.core.record(self.prices, 4096, True, 20000)
-        self.assertIsNone(self.look(4096))
-        self.assertEqual(self.look(4096, True), 20000)
-        self.core.record(self.prices, 4096, False, 1500)
-        self.assertIsNone(self.look(4096))
-        self.assertEqual(self.look(4096, False), 1500)
+        self.assertEqual(self.m(self.last(4096, True, 20000), 4096), (None, False))
 
-    def test_unknown_item(self):
-        self.assertIsNone(self.look(17))
-        self.assertIsNone(self.look(None))
+    def test_unknown_box_item_keeps_it(self):
+        self.assertEqual(self.m(self.last(4096, False, 1500), None), (None, False))
 
-    def test_rejects_bad_bids(self):
-        self.assertFalse(self.core.record(self.prices, 4096, False, 0))
-        self.assertFalse(self.core.record(self.prices, 0, False, 100))
-        self.assertFalse(self.core.record(self.prices, 0xFFFF, False, 100))
+    def test_price_for_any_item(self):
+        self.assertEqual(self.m(self.last(None, None, 800), 17, True), (800, False))
 
-    def test_forget(self):
-        self.core.record(self.prices, 4096, False, 1500)
-        self.assertTrue(self.core.forget(self.prices, 4096))
-        self.assertIsNone(self.look(4096))
-        self.assertFalse(self.core.forget(self.prices, 4096))
+    def test_nothing_remembered(self):
+        self.assertEqual(self.m(None, 4096), (None, False))
+
+    def test_price_range(self):
+        self.assertTrue(self.core.valid_price(99999999))
+        self.assertFalse(self.core.valid_price(100000000))
+        self.assertFalse(self.core.valid_price(0))
 
     def test_find_widths(self):
         data = bytes([0x10, 0x00, 12, 1, 0xE8, 0x03, 0, 0])

@@ -1,6 +1,6 @@
 --[[
 * bidcache - core
-* The price book, and finding things in the game's menu memory, kept free of Ashita so they can
+* The remembered bid, and finding things in the game's menu memory, kept free of Ashita so they can
 * be tested on their own.
 *
 * Each frame the addon copies the open menus' memory (a snapshot). When the auction house replies
@@ -11,54 +11,35 @@
 
 local core = {};
 
-core.MAX_PRICE = 999999999;
+core.MAX_PRICE = 99999999; -- the bid box has eight digits
 
 function core.valid_price(p)
     return type(p) == 'number' and p >= 1 and p <= core.MAX_PRICE and p == math.floor(p);
 end
 
---[[ Price book ]]
+--[[ The remembered bid ]]
 
 --[[
-* prices: { [tostring(item id)] = { single = n, stack = n } }; the latest bid on each kind wins.
+* last: { id = item id (nil: whichever item the next box is for), stack = true/false/nil, price }.
+* The price to put in a box for item id (stack: true or false when the game says which kind the
+* box is for, nil when it doesn't), and whether the remembered bid should be wiped because the
+* box is for a different item. Not knowing the box's kind, a stack's price is never used: in a
+* single's box it would pay far too much.
 --]]
-function core.record(prices, id, stack, price)
-    if (type(id) ~= 'number' or id <= 0 or id >= 0xFFFF or not core.valid_price(price)) then
-        return false;
+function core.match(last, id, stack)
+    if (last == nil or id == nil) then
+        return nil, false;
     end
-    local key = tostring(id);
-    local e = prices[key] or {};
-    e[stack and 'stack' or 'single'] = price;
-    prices[key] = e;
-    return true;
-end
-
---[[
-* The price to put in the box for an item, or nil to leave it at 0. stack is true or false when
-* the game says which kind the bid is for, nil when it doesn't. Not knowing, only a single's
-* price is used, and only when it's the only one saved: in a stack's box that just bids too
-* little, while a stack's price in a single's box would pay far too much.
---]]
-function core.lookup(prices, id, stack)
-    local e = id ~= nil and prices[tostring(id)] or nil;
-    if (e == nil) then
-        return nil;
+    if (last.id ~= nil and last.id ~= id) then
+        return nil, true;
     end
-    if (stack == true) then
-        return e.stack;
-    elseif (stack == false) then
-        return e.single;
-    elseif (e.stack == nil) then
-        return e.single;
+    if (stack ~= nil and last.stack ~= nil and stack ~= last.stack) then
+        return nil, true;
     end
-    return nil;
-end
-
-function core.forget(prices, id)
-    local key = tostring(id);
-    local had = prices[key] ~= nil;
-    prices[key] = nil;
-    return had;
+    if (stack == nil and last.stack == true) then
+        return nil, false;
+    end
+    return last.price, false;
 end
 
 --[[ Finding things in menu memory ]]
