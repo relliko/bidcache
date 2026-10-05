@@ -257,6 +257,38 @@ local function on_open()
     end
 end
 
+--[[
+* With debug on: writes the open bid box's memory and the menu it was opened from to a file in
+* bidcache's settings folder, so a single's box and a stack's box can be compared to find where
+* the game says which it is. Read only.
+--]]
+local dumps = 0;
+local function dump_box()
+    local snap = snapshot(ap.obj, ap.hdr);
+    if (snap == nil) then
+        return;
+    end
+    snapshot(ap.parent_obj, ap.parent_hdr, 'p:', snap);
+    local id = box_item();
+    local dir = settings.settings_path() .. '\\dumps';
+    ashita.fs.create_dir(dir);
+    dumps = dumps + 1;
+    local path = ('%s\\%s_%d_%s.txt'):fmt(dir, os.date('%Y%m%d-%H%M%S'), dumps, tostring(id or 'unknown'));
+    local f = io.open(path, 'w');
+    if (f == nil) then
+        return;
+    end
+    f:write(('item %s from "%s"\n'):fmt(tostring(id), ap.box_parent or ''));
+    local keys = {};
+    for k in pairs(snap) do keys[#keys + 1] = k; end
+    table.sort(keys);
+    for _, k in ipairs(keys) do
+        f:write(k, ' ', (snap[k]:gsub('.', function (c) return ('%02X'):format(c:byte()); end)), '\n');
+    end
+    f:close();
+    msg(('Saved the bid box\'s memory to %s.'):fmt(path));
+end
+
 -- Writes the price into the open box while it still reads 0 (the box may zero itself as it opens).
 local function fill_step()
     local f, s = ap.fill, ap.settings;
@@ -441,9 +473,17 @@ ashita.events.register('d3d_present', 'bidcache_present', function ()
     end
     if (changed) then
         on_open();
+        ap.dump = s.debug and 0 or nil;
     end
     if (ap.fill ~= nil) then
         fill_step();
+    end
+    if (ap.dump ~= nil) then
+        ap.dump = ap.dump + 1;
+        if (ap.dump == 3) then
+            dump_box();
+            ap.dump = nil;
+        end
     end
 end);
 

@@ -46,6 +46,7 @@ os.clock = function () return clock end
 local writes = 0
 ashita = {
     events = { register = function (name, _, fn) events[name] = fn end },
+    fs = { create_dir = function () end },
     memory = { find = function () return 0x1000 end, write_uint32 = function (a, v) writes = writes + 1 w32(a, v) end },
 }
 local selected = 0
@@ -76,7 +77,10 @@ package.loaded['settings'] = {
                   sel_ok = false, parents = {}, debug = true }
         return store
     end,
-    save = function () end, register = function () end }
+    save = function () end, register = function () end, settings_path = function () return 'cfg' end }
+-- Debug dumps go nowhere.
+local dumped = 0
+io.open = function () dumped = dumped + 1 return { write = function () end, close = function () end } end
 print = function () end
 
 dofile('bidcache.lua')
