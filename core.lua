@@ -20,18 +20,27 @@ end
 --[[ The remembered bid ]]
 
 --[[
-* last: { id = item id (nil: whichever item the next box is for), stack = true/false/nil, price }.
-* The price to put in a box for item id (stack: true or false when the game says which kind the
-* box is for, nil when it doesn't), and whether the remembered bid should be wiped because the
-* box is for a different item. Not knowing the box's kind, a stack's price is never used: in a
-* single's box it would pay far too much.
+* last: { id = item id (nil: whichever item the next box is for), stack = true/false/nil,
+* row = the auction list row it was picked from (nil: not known), price }.
+* The price to put in a box for item id picked from row (stack: true or false when the game says
+* which kind the box is for, nil when it doesn't), and whether the remembered bid should be wiped
+* because the box is for a different listing. A single and a stack of the same item are different
+* rows of the auction list, so a different row is a different listing. Not knowing the box's row
+* or kind, a price that might be a stack's is never used: in a single's box it would pay far too
+* much.
 --]]
-function core.match(last, id, stack)
+function core.match(last, id, stack, row)
     if (last == nil or id == nil) then
         return nil, false;
     end
     if (last.id ~= nil and last.id ~= id) then
         return nil, true;
+    end
+    if (row ~= nil and last.row ~= nil and row ~= last.row) then
+        return nil, true;
+    end
+    if (row == nil and last.row ~= nil) then
+        return nil, false;
     end
     if (stack ~= nil and last.stack ~= nil and stack ~= last.stack) then
         return nil, true;

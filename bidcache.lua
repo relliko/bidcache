@@ -3,9 +3,10 @@
 *
 * Remembers your last auction house bid and writes its price straight back into the bid box when
 * you bid on the same item again, so you can press Enter at once instead of building the number
-* up from 0 with the arrows again. Opening the box for a different item (or the other kind:
-* single or stack) forgets it, so a big price never lands on a cheap item. It's only kept while
-* the game runs.
+* up from 0 with the arrows again. Opening the box for a different listing forgets it, so a big
+* price never lands on a cheap item. A single and a stack of the same item are different rows of
+* the auction list, and the list keeps the row you picked, so they count as different listings.
+* It's only kept while the game runs.
 *
 * - The bid comes from the auction house's reply (incoming packet 0x04C, command 0x0E), which
 *   echoes the price you entered, the item and the quantity, whether the bid won or not.
@@ -30,7 +31,7 @@
 
 addon.name    = 'bidcache';
 addon.author  = 'Relli';
-addon.version = '0.5';
+addon.version = '0.6';
 addon.desc    = 'Puts your last auction house bid price back in the bid box when you bid on the same item again.';
 addon.link    = 'https://github.com/relliko/bidcache';
 
@@ -52,6 +53,7 @@ local defaults = T{
 };
 
 local OBJ_SIZE, HDR_SIZE, CHILD_SIZE, MAX_CHILDREN = 0x400, 0x200, 0x100, 64;
+local LIST_ROW = 0x4C;   -- in the auction list menu: the row you picked (a single and its stack are different rows)
 local RECENT = 5;        -- seconds a closed menu's copy is kept for matching a bid reply
 local AH_CLOSE_WAIT = 1; -- seconds with no menu open before the auction house counts as left
 
@@ -76,6 +78,9 @@ local ap = {
     box_parent = nil, -- the menu the bid box was last opened from
     box_psnap = nil,  -- a copy of it, taken as the box opened
     last = nil,       -- your last bid, see core.match; never saved
+    seen = {},        -- [menu name] = { obj, hdr } of the latest of each menu (for debug dumps)
+    from = {},        -- [menu name] = { obj } of the menu it was last opened from
+    box_row = nil,    -- the auction list row the bid box was last opened for
 };
 
 local function reset_places()
@@ -225,10 +230,24 @@ local function box_item()
     return id, stack;
 end
 
--- The bid box just opened: fill it if it's the auction house's and you've bid on the item before.
+--[[
+* The auction list row the open bid box is for, or nil: the box opens from the item's window
+* (auc3), which opens from the list (auclist), and the list keeps the row you picked.
+--]]
+local function box_row()
+    local list = ap.from[ap.parent];
+    local row = list ~= nil and safemem.u32(list.obj + LIST_ROW) or nil;
+    if (row == nil or row > 0xFFFF) then
+        return nil;
+    end
+    return row;
+end
+
+-- The bid box just opened: fill it if it's the auction house's and you last bid on this listing.
 local function on_open()
     local s = ap.settings;
     ap.box_parent = ap.parent;
+    ap.box_row = box_row();
     ap.box_psnap = snapshot(ap.parent_obj, ap.parent_hdr, 'p:');
     -- After a bid that didn't match the box's place, nothing is written until it's found again.
     if (s.place == '' or not ap.at_ah or ap.misses > 0) then
@@ -241,14 +260,16 @@ local function on_open()
         return;
     end
     local id, stack = box_item();
-    local price, wipe = core.match(ap.last, id, stack);
+    local price, wipe = core.match(ap.last, id, stack, ap.box_row);
     if (wipe) then
         ap.last = nil;
     elseif (price ~= nil and ap.last.id == nil) then
-        ap.last.id, ap.last.stack = id, stack; -- a price set with /bidcache price is for this item
+        -- A price set with /bidcache price is for this listing.
+        ap.last.id, ap.last.stack, ap.last.row = id, stack, ap.box_row;
     end
     if (s.debug) then
         local kind = stack == true and 'stack' or stack == false and 'single' or 'single or stack';
+        kind = kind .. (ap.box_row ~= nil and (', list row %d'):fmt(ap.box_row) or ', list row unknown');
         msg(('Box for %s (%s): %s.'):fmt(id ~= nil and item_name(id) or 'an unknown item', kind,
             price ~= nil and gil(price) or 'no price to fill'));
     end
@@ -263,13 +284,50 @@ end
 * the game says which it is. Read only.
 --]]
 local dumps = 0;
+-- Copies a menu and what its pointers point to, two levels deep, into snap under prefix.
+local function deep_snapshot(obj, hdr, prefix, snap)
+    local o = obj ~= 0 and safemem.read(obj, 0x200) or nil;
+    if (o == nil) then
+        return;
+    end
+    snap[prefix .. 'v'] = o;
+    snap[prefix .. 'h'] = safemem.read(hdr, HDR_SIZE);
+    local seen, n = { [obj] = true, [hdr] = true }, 0;
+    local function walk(data, name, depth)
+        for off = 0, #data - 4, 4 do
+            local p = core.u32(data, off);
+            if (n < 400 and looks_like_ptr(p) and not seen[p]) then
+                seen[p] = true;
+                local c = safemem.read(p, 0x100);
+                if (c ~= nil) then
+                    n = n + 1;
+                    local key = name .. '@' .. off;
+                    snap[prefix .. key] = c;
+                    if (depth < 2) then
+                        walk(c, key, depth + 1);
+                    end
+                end
+            end
+        end
+    end
+    walk(o, 'v', 1);
+end
+
 local function dump_box()
     local snap = snapshot(ap.obj, ap.hdr);
     if (snap == nil) then
         return;
     end
     snapshot(ap.parent_obj, ap.parent_hdr, 'p:', snap);
+    for name, m in pairs(ap.seen) do
+        if (name:match('^auc') ~= nil) then
+            deep_snapshot(m.obj, m.hdr, name .. ':', snap);
+        end
+    end
     local id = box_item();
+    local inv = AshitaCore:GetMemoryManager():GetInventory();
+    snap['selected'] = ('%d %d %s'):fmt(inv:GetSelectedItemId() or -1, inv:GetSelectedItemIndex() or -1,
+        tostring(inv:GetSelectedItemName()));
     local dir = settings.settings_path() .. '\\dumps';
     ashita.fs.create_dir(dir);
     dumps = dumps + 1;
@@ -334,7 +392,7 @@ end
 local function on_bid(price, id, qty)
     local s = ap.settings;
     local stack = qty > 1;
-    ap.last = { id = id, stack = stack, price = price };
+    ap.last = { id = id, stack = stack, price = price, row = ap.box_row };
     s.sel_ok = AshitaCore:GetMemoryManager():GetInventory():GetSelectedItemId() == id;
     if (s.debug) then
         msg(('Bid %s on %s%s.'):fmt(gil(price), item_name(id), stack and (' (stack of %d)'):fmt(qty) or ''));
@@ -448,8 +506,14 @@ ashita.events.register('d3d_present', 'bidcache_present', function ()
         end
         if (ap.menu ~= '' and ap.menu ~= name) then
             ap.parent, ap.parent_obj, ap.parent_hdr = ap.menu, ap.obj, ap.hdr;
+            if (name ~= '' and not price_menu(ap.menu)) then
+                ap.from[name] = { obj = ap.obj };
+            end
         end
         ap.menu, ap.obj, ap.hdr = name, obj, hdr;
+        if (name ~= '') then
+            ap.seen[name] = { obj = obj, hdr = hdr };
+        end
         ap.snap, ap.fill, ap.box_psnap, ap.box_parent = nil, nil, nil, nil;
         if (s.debug) then
             msg(('Menu "%s" (from "%s")%s.'):fmt(name, ap.parent, ap.at_ah and ', at the auction house' or ''));
@@ -458,7 +522,7 @@ ashita.events.register('d3d_present', 'bidcache_present', function ()
     if (name == '') then
         ap.no_menu_since = ap.no_menu_since or os.clock();
         if (os.clock() - ap.no_menu_since >= AH_CLOSE_WAIT) then
-            ap.at_ah, ap.parent, ap.parent_obj, ap.parent_hdr = false, '', 0, 0;
+            ap.at_ah, ap.parent, ap.parent_obj, ap.parent_hdr, ap.seen, ap.from = false, '', 0, 0, {}, {};
         end
         return;
     end
@@ -512,7 +576,7 @@ ashita.events.register('command', 'bidcache_command', function (e)
             msg('Forgot the last bid: the box opens at 0.');
         elseif (core.valid_price(n)) then
             local l = ap.last or {};
-            ap.last = { id = l.id, stack = l.stack, price = n };
+            ap.last = { id = l.id, stack = l.stack, row = l.row, price = n };
             msg(('The box opens at %s for %s.'):fmt(gil(n), l.id ~= nil and item_name(l.id) or 'the next item you bid on'));
         else
             msg(('/bidcache price <0-%s>   0 forgets the last bid'):fmt((gil(core.MAX_PRICE):gsub(' gil', ''))));

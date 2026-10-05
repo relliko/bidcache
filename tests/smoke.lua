@@ -52,7 +52,8 @@ ashita = {
 local selected = 0
 AshitaCore = {
     GetMemoryManager = function () return { GetInventory = function () return {
-        GetSelectedItemId = function () return selected end } end } end,
+        GetSelectedItemId = function () return selected end, GetSelectedItemIndex = function () return 0 end,
+        GetSelectedItemName = function () return '' end } end } end,
     GetResourceManager = function () return {
         GetItemById = function (_, id) return { Name = { 'Item' .. id } } end,
     } end,
@@ -98,9 +99,13 @@ local function at_ah()
     show('auclist') frames()
     packet(0x0A)
 end
--- Opens the bid box for an item from the list; returns what it shows.
-local function open_box(item, qty)
-    show('auclist') frames()
+-- Opens the bid box for an item picked from the list (at row: 1 by default) through its item
+-- window, like the game; returns what the box shows.
+local function open_box(item, qty, row)
+    show('auclist')
+    w32(obj + 0x4C, row or 1)
+    frames()
+    show('auc3') frames()
     show('moneyctr', item, qty) frames()
     return r32(num)
 end
@@ -121,7 +126,7 @@ at_ah()
 selected = 100
 assert(open_box(100) == 0)
 bid(1200, 100)
-assert(store.sel_ok and store.parents[1] == 'auclist')
+assert(store.sel_ok and store.parents[1] == 'auc3')
 assert(store.prices == nil, 'prices must not be saved')
 -- Bidding on item 100 again: it already holds 1200 (from the game's selected item, for now).
 assert(open_box(100) == 1200, 'not filled from the selected item')
@@ -148,6 +153,18 @@ assert(open_box(100, 12) == 20000, 'stack price not filled')
 bid(nil, 100, 12)
 -- The single after the stack is the other kind: 0, so the stack's price can't land on a single.
 assert(open_box(100, 1) == 0, 'stack price landed on a single')
+
+-- A single at row 1 and its stack at row 2 of the list: picking the other row is another listing,
+-- so the box opens at 0 even before bidcache could tell a stack's box from a single's.
+store.qty_place = ''
+open_box(300, 1, 1) bid(150, 300)
+assert(open_box(300, 1, 1) == 150, 'same row not filled')
+bid(nil, 300)
+assert(open_box(300, 12, 2) == 0, 'single price landed on the stack row')
+bid(1700, 300, 12)
+assert(open_box(300, 12, 2) == 1700, 'stack row not filled')
+bid(nil, 300, 12)
+assert(open_box(300, 1, 1) == 0, 'stack price landed on the single row')
 
 -- /bidcache price: 0 forgets the bid; a price with no bid behind it is for whichever item is next.
 open_box(100) bid(900, 100)

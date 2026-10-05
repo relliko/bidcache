@@ -66,15 +66,15 @@ class FindTests(unittest.TestCase):
 class LastBidTests(unittest.TestCase):
     def setUp(self):
         self.lua, self.core = runtime()
-        self.match = self.lua.eval("function (c, last, id, stack) local p, w = c.match(last, id, stack) return {p, w} end")
+        self.match = self.lua.eval("function (c, last, id, stack, row) local p, w = c.match(last, id, stack, row) return {p, w} end")
 
     def last(self, id, stack, price):
         t = self.lua.eval("{}")
         t['id'], t['stack'], t['price'] = id, stack, price
         return t
 
-    def m(self, last, id, stack=None):
-        r = self.match(self.core, last, id, stack)
+    def m(self, last, id, stack=None, row=None):
+        r = self.match(self.core, last, id, stack, row)
         return r[1], r[2]
 
     def test_same_item(self):
@@ -100,6 +100,13 @@ class LastBidTests(unittest.TestCase):
 
     def test_nothing_remembered(self):
         self.assertEqual(self.m(None, 4096), (None, False))
+
+    def test_other_row_wipes(self):
+        last = self.last(4096, None, 1500)
+        last['row'] = 1
+        self.assertEqual(self.m(last, 4096, None, 1), (1500, False))
+        self.assertEqual(self.m(last, 4096, None, 2), (None, True))
+        self.assertEqual(self.m(last, 4096, None, None), (None, False))
 
     def test_price_range(self):
         self.assertTrue(self.core.valid_price(99999999))

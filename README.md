@@ -4,9 +4,11 @@ Ashita v4 addon: remembers your last auction house bid and writes its price stra
 the bid box when you bid on the same item again, so you can press Enter at once instead of
 building the number up from 0 with the arrows again. No keys are pressed.
 
-- **One bid, only while the game runs.** Opening the bid box for a different item, or for the
-  other kind (a single after a stack, or a stack after a single), forgets it and leaves the box
-  at 0, so a big price never lands on a cheap item. Prices are never saved to disk.
+- **One bid, only while the game runs.** Opening the bid box for a different listing forgets it
+  and leaves the box at 0, so a big price never lands on a cheap item. A single and a stack of
+  the same item are different rows of the auction list, and the list keeps the row you picked
+  (at +0x4C of the list menu), so switching between them counts as a different listing. Prices
+  are never saved to disk.
 - **The bid** comes from the auction house's reply (incoming packet 0x04C, command 0x0E), which
   echoes the price you entered, the item and the quantity, won or outbid.
 - **The box** is the game's `moneyctr` menu. Its number sits at +40 in the object that a pointer
@@ -39,7 +41,9 @@ client memory, and writes only the bid box's own number.
     /bidcache price <n>         the price the box opens at, 0 to 99,999,999; 0 forgets the last
                                 bid. With no bid behind it, it's for the next item you bid on
     /bidcache relearn           find the bid box and its item again
-    /bidcache debug [on|off]    print menu names, each box's item, and what learning finds
+    /bidcache debug [on|off]    print menu names, each box's item and list row, and what
+                                learning finds; also saves the bid box's memory to files in
+                                bidcache's settings folder each time it opens
 
 ## Tests
 
