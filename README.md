@@ -30,17 +30,35 @@ building the number up from 0 with the arrows again. No keys are pressed.
   only filled after the auction house has sent something since every menu was last closed, and,
   once a bid has shown which menu you bid from, only when opened from that menu.
 
-Nothing is sent to the server and no packet is changed: bidcache reads incoming packets and
-client memory, and writes only the bid box's own number.
+## Selling
+
+The same goes for listings: sell an item and its price goes back in the sell price box the next
+time you sell that item. Selling a different item forgets it. Nothing is saved to disk.
+
+- **The listing** comes from what you ask the auction house (outgoing packet 0x04E, command
+  0x04: the price you typed, the item, its inventory slot, single or stack). It's kept once the
+  auction house says the item is up (incoming 0x04C, command 0x0B, result 1); a failed listing
+  is ignored.
+- **The sell price box** is the same `moneyctr` box, opened from a different menu. That menu is
+  learned from your first listing; a box opened from it only ever gets a listing's price, never
+  a bid's, and the bid box never gets a listing's price.
+- **Which item** is the game's selected item, once a listing has shown it matches.
+- **Singles and stacks.** A slot holding less than a full stack (or an item that doesn't stack)
+  can only be sold as a single. A full stack could be either, so there a single's price is never
+  filled (it would sell the whole stack far too cheap), while a stack's price is (at worst a
+  single asks too much, and you see it before agreeing to the fee).
+
+Nothing is sent to the server and no packet is changed: bidcache reads packets and client
+memory, and writes only the price box's own number.
 
 ## Commands
 
     /addon load bidcache
-    /bidcache (or /bc)          the last bid, what's been found so far, and help
+    /bidcache (or /bc)          the last bid and listing, what's been found so far, and help
     /bidcache on|off            fill the bid box or not
     /bidcache price <n>         the price the box opens at, 0 to 99,999,999; 0 forgets the last
                                 bid. With no bid behind it, it's for the next item you bid on
-    /bidcache relearn           find the bid box and its item again
+    /bidcache relearn           find the bid box, its item and the sell price box again
     /bidcache debug [on|off]    print menu names, each box's item and list row, and what
                                 learning finds; also saves the bid box's memory to files in
                                 bidcache's settings folder each time it opens

@@ -49,13 +49,15 @@ ashita = {
     fs = { create_dir = function () end },
     memory = { find = function () return 0x1000 end, write_uint32 = function (a, v) writes = writes + 1 w32(a, v) end },
 }
-local selected = 0
+local selected, sel_idx = 0, 0
+local bag = {} -- [slot] = { Id, Count }
 AshitaCore = {
     GetMemoryManager = function () return { GetInventory = function () return {
-        GetSelectedItemId = function () return selected end, GetSelectedItemIndex = function () return 0 end,
+        GetSelectedItemId = function () return selected end, GetSelectedItemIndex = function () return sel_idx end,
+        GetContainerItem = function (_, _, i) return bag[i] end,
         GetSelectedItemName = function () return '' end } end } end,
     GetResourceManager = function () return {
-        GetItemById = function (_, id) return { Name = { 'Item' .. id } } end,
+        GetItemById = function (_, id) return { Name = { 'Item' .. id }, StackSize = id >= 500 and 12 or 1 } end,
     } end,
 }
 struct = { unpack = function (fmt, s, pos)
@@ -75,7 +77,7 @@ local store = nil
 package.loaded['settings'] = {
     load = function (d)
         store = { enabled = true, menus = { d.menus[1] }, place = d.place, item_place = '', qty_place = '',
-                  sel_ok = false, parents = {}, debug = true }
+                  sel_ok = false, parents = {}, sell_parents = {}, sale_sel_ok = false, debug = true }
         return store
     end,
     save = function () end, register = function () end, settings_path = function () return 'cfg' end }
@@ -116,6 +118,32 @@ local function bid(entered, item, qty)
     local price = r32(num)
     show('auclist') frames()
     packet(0x0E, price, item, qty or 1)
+    return price
+end
+
+-- Selling: the price box opens from your inventory at the counter. Picks slot idx, opens the box,
+-- and returns what it shows.
+local function open_sale(idx)
+    show('inventor') frames()
+    selected, sel_idx = bag[idx].Id, idx
+    show('moneyctr') frames()
+    return r32(num)
+end
+local function out(cmd, price, idx, item, stacks)
+    local d = string.char(0x4E, 0x0A, 0, 0, cmd, 0xFF, 0, 0) .. le(price, 4) .. le(idx, 2) .. le(item or 0, 2)
+        .. le(stacks or 0, 4) .. string.rep(string.char(0), 0x40)
+    events.packet_out({ id = 0x04E, size = #d, data = d })
+end
+-- Lists what's in the box (or what you enter) and agrees to the fee; ok = false: the listing fails.
+local function sell(entered, idx, stack, ok)
+    if (entered ~= nil) then w32(num, entered) end
+    frames(2)
+    local price = r32(num)
+    out(0x04, price, idx, bag[idx].Id, stack and 0 or 1)
+    show('inventor') frames()
+    out(0x0B, price, idx, 0, stack and 0 or 1)
+    local d = string.char(0x4C, 0x0A, 0, 0, 0x0B, 0xFF, ok == false and 197 or 1) .. string.rep(string.char(0), 0x40)
+    events.packet_in({ id = 0x04C, size = #d, data = d })
     return price
 end
 
@@ -209,11 +237,42 @@ assert(store.place == 'v@12|48', 'new place not found: ' .. store.place)
 assert(open_box(100) == 1800)
 bid(nil, 100)
 
+-- Selling. Slot 1: 5 of item 600 (stacks to 12), slot 2: item 100 (doesn't stack), slot 3: a full
+-- stack of item 700. A bid on item 600 first: its price never lands in the sell box.
+store.parents = { 'auc3' }
+at_ah()
+bag[1], bag[2], bag[3] = { Id = 600, Count = 5 }, { Id = 100, Count = 1 }, { Id = 700, Count = 12 }
+open_box(600) bid(3000, 600)
+assert(open_sale(1) == 0, 'bid price landed in the sell box')
+sell(800, 1)
+assert(store.sell_parents[1] == 'inventor' and store.sale_sel_ok, 'sell box not learned')
+assert(store.sale_last == nil, 'listing must not be saved')
+assert(open_sale(1) == 800, 'sell price not filled')
+sell(nil, 1)
+-- A different item: 0, and the 800 is forgotten.
+assert(open_sale(2) == 0, 'sell price landed on another item')
+assert(open_sale(1) == 0, 'last listing not forgotten')
+-- A failed listing isn't remembered; the previous one stays.
+sell(900, 1)
+assert(open_sale(1) == 900)
+sell(5000, 1, false, false)
+assert(open_sale(1) == 900, 'failed listing remembered')
+-- A full stack can be listed as a single or a stack: a single's price is never filled into it.
+open_sale(3) sell(400, 3, false)
+assert(open_sale(3) == 0, 'single price landed on a full stack')
+sell(4000, 3, true)
+assert(open_sale(3) == 4000, 'stack price not filled')
+sell(nil, 3, true)
+-- Bids still work, and still aren't filled with a listing's price.
+assert(open_box(700) == 0, 'listing price landed in the bid box')
+assert(writes > 0)
+
 local w = writes
 for _, c in ipairs({ '/bidcache', '/bc off', '/bc on', '/bc debug off', '/bc price x', '/bc relearn' }) do
     cmd(c)
 end
 assert(store.place == '' and store.item_place == '' and store.qty_place == '' and #store.menus == 0)
+assert(#store.sell_parents == 0 and not store.sale_sel_ok)
 assert(writes == w)
 events.unload()
 io.write('smoke ok\n')

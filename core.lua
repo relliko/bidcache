@@ -51,6 +51,31 @@ function core.match(last, id, stack, row)
     return last.price, false;
 end
 
+--[[ The remembered listing ]]
+
+--[[
+* last: { id = item id, stack = true/false, price } of your last auction house listing.
+* The price to put in the sell price box for item id (stack: true or false when bidcache can tell
+* which kind you're selling, nil when it can't), and whether the remembered listing should be
+* wiped because the box is for a different item. Not knowing the kind, a single's price is never
+* used: on a stack it would sell far too cheap. A stack's price on a single only asks too much.
+--]]
+function core.match_sale(last, id, stack)
+    if (last == nil or id == nil) then
+        return nil, false;
+    end
+    if (last.id ~= id) then
+        return nil, true;
+    end
+    if (stack ~= nil and stack ~= last.stack) then
+        return nil, false;
+    end
+    if (stack == nil and not last.stack) then
+        return nil, false;
+    end
+    return last.price, false;
+end
+
 --[[ Finding things in menu memory ]]
 
 local function u32(s, o)

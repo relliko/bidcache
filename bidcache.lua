@@ -25,14 +25,25 @@
 *   closed, and, once a bid has shown which menu you bid from, only when opened from that menu.
 *   It only writes while the box still reads 0.
 *
+* Selling works the same way: list an item and its price goes back in the sell price box the next
+* time you sell that item, until you sell a different one.
+* - The listing comes from what you ask the auction house (outgoing packet 0x04E, command 0x04:
+*   the price, the item, its inventory slot and single or stack), kept once the auction house says
+*   it's up (incoming 0x04C, command 0x0B, result 1).
+* - The sell price box is the same 'moneyctr' box, opened from another menu; that menu is learned
+*   from your first listing, and a box opened from it only ever gets a listing's price, never a
+*   bid's. The item is the game's selected item, once a listing has shown it matches.
+* - A full stack can be sold as a single or a stack. Not knowing which, a single's price is never
+*   filled (it would sell the stack far too cheap); a stack's price is.
+*
 * Nothing is ever sent to the server, no packet is changed, and no key is pressed: bidcache reads
-* incoming packets and client memory, and writes only the bid box's own number.
+* packets and client memory, and writes only the price box's own number.
 --]]
 
 addon.name    = 'bidcache';
 addon.author  = 'Relli';
 addon.version = '0.6.1';
-addon.desc    = 'Puts your last auction house bid price back in the bid box when you bid on the same item again.';
+addon.desc    = 'Puts your last auction house bid, or listing price, back in the price box when you bid on or sell the same item again.';
 addon.link    = 'https://github.com/relliko/bidcache';
 
 require('common');
@@ -49,6 +60,8 @@ local defaults = T{
     qty_place = '',          -- where it keeps the quantity (1, or the stack size); learned
     sel_ok = false,          -- the game's selected item matched the last bid's item
     parents = T{},           -- menus the bid box has been opened from; learned from your bids
+    sell_parents = T{},      -- menus the sell price box has been opened from; learned from your listings
+    sale_sel_ok = false,     -- the game's selected item was the item a listing was for
     debug = false,           -- print menu changes and what learning finds
 };
 
@@ -81,6 +94,9 @@ local ap = {
     seen = {},        -- [menu name] = { obj, hdr } of the latest of each menu (for debug dumps)
     from = {},        -- [menu name] = { obj } of the menu it was last opened from
     box_row = nil,    -- the auction list row the bid box was last opened for
+    box_sel = nil,    -- { id, idx } the game's selected item as the box last opened
+    sale = nil,       -- { id, stack, price, idx } a listing you've asked to put up; never saved
+    sale_last = nil,  -- your last listing, see core.match_sale; never saved
 };
 
 local function reset_places()
@@ -243,14 +259,64 @@ local function box_row()
     return row;
 end
 
+--[[
+* The item an inventory slot holds, and whether selling it is for a stack: false when it can only
+* be a single (it doesn't stack, or the slot holds less than a full stack), nil when it could be
+* either. nil for the item when the slot doesn't hold id.
+--]]
+local function sale_item(id, idx)
+    local inv = AshitaCore:GetMemoryManager():GetInventory();
+    local item = (id ~= nil and id ~= 0 and idx ~= nil) and inv:GetContainerItem(0, idx) or nil;
+    if (item == nil or item.Id ~= id) then
+        return nil, nil;
+    end
+    local res = AshitaCore:GetResourceManager():GetItemById(id);
+    local size = res ~= nil and res.StackSize or 1;
+    if (size <= 1 or item.Count < size) then
+        return id, false;
+    end
+    return id, nil;
+end
+
+-- The sell price box just opened: fill it if you last listed this item, the same kind.
+local function on_open_sale()
+    local s = ap.settings;
+    if (not s.sale_sel_ok) then
+        if (s.debug) then
+            msg('Not filling the sell price: the selected item didn\'t match your last listing.');
+        end
+        return;
+    end
+    local id, stack = sale_item(ap.box_sel.id, ap.box_sel.idx);
+    local price, wipe = core.match_sale(ap.sale_last, id, stack);
+    if (wipe) then
+        ap.sale_last = nil;
+    end
+    if (s.debug) then
+        local kind = stack == true and 'stack' or stack == false and 'single' or 'single or stack';
+        msg(('Sell box for %s (%s): %s.'):fmt(id ~= nil and item_name(id) or 'an unknown item', kind,
+            price ~= nil and gil(price) or 'no price to fill'));
+    end
+    if (price ~= nil) then
+        ap.fill = { polls = 0, writes = 0, price = price };
+    end
+end
+
 -- The bid box just opened: fill it if it's the auction house's and you last bid on this listing.
 local function on_open()
     local s = ap.settings;
+    local inv = AshitaCore:GetMemoryManager():GetInventory();
     ap.box_parent = ap.parent;
     ap.box_row = box_row();
     ap.box_psnap = snapshot(ap.parent_obj, ap.parent_hdr, 'p:');
+    ap.box_sel = { id = inv:GetSelectedItemId(), idx = inv:GetSelectedItemIndex() };
     -- After a bid that didn't match the box's place, nothing is written until it's found again.
     if (s.place == '' or not ap.at_ah or ap.misses > 0) then
+        return;
+    end
+    -- Opened from where you sell: it's the sell price box, never filled with a bid.
+    if (listed(s.sell_parents, ap.parent)) then
+        on_open_sale();
         return;
     end
     if (#s.parents > 0 and not listed(s.parents, ap.parent)) then
@@ -427,7 +493,8 @@ local function on_bid(price, id, qty)
         table.insert(s.menus, entry.name);
         msg(('Found the bid box ("%s").'):fmt(entry.name));
     end
-    if (entry.parent ~= nil and entry.parent ~= '' and not listed(s.parents, entry.parent)) then
+    if (entry.parent ~= nil and entry.parent ~= '' and not listed(s.parents, entry.parent)
+        and not listed(s.sell_parents, entry.parent)) then
         table.insert(s.parents, entry.parent);
     end
 
@@ -456,6 +523,53 @@ local function on_bid(price, id, qty)
     settings.save();
 end
 
+--[[
+* You've asked the auction house to put an item up (the price is typed, the fee not yet agreed):
+* remember the listing until the auction house says it's up, and learn which menu the sell price
+* box opens from. stacks: 0 for a stack, 1 for a single, as the game sends it.
+--]]
+local function on_ask_sale(price, idx, id, stacks)
+    local s = ap.settings;
+    ap.sale = { id = id, stack = stacks == 0, price = price, idx = idx };
+    if (s.debug) then
+        msg(('Listing %s%s at %s.'):fmt(item_name(id), stacks == 0 and ' (stack)' or '', gil(price)));
+    end
+    -- The box you typed the price into: still open, or closed a moment ago.
+    local snap, parent = nil, nil;
+    if (price_menu(ap.menu) and ap.snap ~= nil) then
+        snap, parent = ap.snap, ap.box_parent;
+    else
+        local now = os.clock();
+        for _, c in ipairs(ap.closed) do
+            if (now - c.t <= RECENT and price_menu(c.name)) then
+                snap, parent = c.snap, c.parent;
+                break;
+            end
+        end
+    end
+    local sel = ap.box_sel;
+    if (snap == nil or sel == nil or s.place == '' or not core.find(snap, price)[s.place]) then
+        if (s.debug) then
+            msg('The price box that held that price wasn\'t found.');
+        end
+        return;
+    end
+    s.sale_sel_ok = sel.id == id and sel.idx == idx;
+    if (s.debug and not s.sale_sel_ok) then
+        msg('The game\'s selected item wasn\'t the item you listed; the sell price won\'t be filled.');
+    end
+    if (parent ~= nil and parent ~= '' and not listed(s.sell_parents, parent)) then
+        table.insert(s.sell_parents, parent);
+        for i = #s.parents, 1, -1 do
+            if (s.parents[i] == parent) then
+                table.remove(s.parents, i);
+            end
+        end
+        msg(('Found the sell price box (opened from "%s").'):fmt(parent));
+    end
+    settings.save();
+end
+
 ashita.events.register('unload', 'bidcache_unload', function ()
     settings.save();
 end);
@@ -479,7 +593,22 @@ ashita.events.register('packet_in', 'bidcache_packet_in', function (e)
         return;
     end
     ap.at_ah = true;
-    if (e.size < 0x14 or e.data:byte(0x04 + 1) ~= 0x0E) then
+    if (e.size < 0x14) then
+        return;
+    end
+    local cmd = e.data:byte(0x04 + 1);
+    if (cmd == 0x0B) then
+        -- Your listing is up (result 1): it's the one to fill next time.
+        if (ap.sale ~= nil and e.data:byte(0x06 + 1) == 0x01) then
+            ap.sale_last = { id = ap.sale.id, stack = ap.sale.stack, price = ap.sale.price };
+            if (ap.settings.debug) then
+                msg(('Listed %s at %s.'):fmt(item_name(ap.sale.id), gil(ap.sale.price)));
+            end
+        end
+        ap.sale = nil;
+        return;
+    end
+    if (cmd ~= 0x0E) then
         return;
     end
     local price = struct.unpack('I4', e.data, 0x08 + 1);
@@ -487,6 +616,36 @@ ashita.events.register('packet_in', 'bidcache_packet_in', function (e)
     local qty = struct.unpack('I4', e.data, 0x10 + 1);
     if (core.valid_price(price) and id > 0 and id < 0xFFFF and qty >= 1 and qty <= 99) then
         on_bid(price, id, qty);
+    end
+end);
+
+--[[
+* event: packet_out
+* desc : 0x04E is what you ask the auction house. Putting an item up is asked twice: command 0x04
+*        with the price you typed at 0x08, the inventory slot at 0x0C, the item at 0x0E and 0 for
+*        a stack (1 for a single) at 0x10, then, once you agree to the fee, command 0x0B with the
+*        price and the slot again. Read only: nothing is changed or sent.
+--]]
+ashita.events.register('packet_out', 'bidcache_packet_out', function (e)
+    if (e.id ~= 0x04E or e.size < 0x14) then
+        return;
+    end
+    local data = e.data_modified or e.data;
+    local cmd = data:byte(0x04 + 1);
+    local price = struct.unpack('I4', data, 0x08 + 1);
+    local idx = struct.unpack('H', data, 0x0C + 1);
+    if (cmd == 0x04) then
+        local id = struct.unpack('H', data, 0x0E + 1);
+        local stacks = struct.unpack('I4', data, 0x10 + 1);
+        if (core.valid_price(price) and id > 0 and id < 0xFFFF and stacks <= 1) then
+            on_ask_sale(price, idx, id, stacks);
+        end
+    elseif (cmd == 0x0B and ap.sale ~= nil) then
+        if (idx == ap.sale.idx and core.valid_price(price)) then
+            ap.sale.price = price;
+        else
+            ap.sale = nil;
+        end
     end
 end);
 
@@ -583,6 +742,7 @@ ashita.events.register('command', 'bidcache_command', function (e)
         end
     elseif (cmd == 'relearn') then
         s.menus, s.place, s.parents, s.item_place, s.qty_place, s.sel_ok = T{}, '', T{}, '', '', false;
+        s.sell_parents, s.sale_sel_ok = T{}, false;
         ap.learn, ap.misses = {}, 0;
         reset_places();
         settings.save();
@@ -594,9 +754,15 @@ ashita.events.register('command', 'bidcache_command', function (e)
         local l = ap.last;
         msg(l == nil and 'No last bid: the box opens at 0.' or ('Last bid %s on %s%s.'):fmt(gil(l.price),
             l.id ~= nil and item_name(l.id) or 'the next item', l.stack and ' (stack)' or ''));
+        local sl = ap.sale_last;
+        msg(sl == nil and 'No last listing: the sell price box opens at 0.' or ('Last listing %s at %s%s.'):fmt(
+            item_name(sl.id), gil(sl.price), sl.stack and ' (stack)' or ''));
+        if (#s.sell_parents == 0) then
+            msg('Sell price box not found yet; your next listing finds it.');
+        end
         msg('/bidcache on|off            fill the bid box (now ' .. (s.enabled and 'on' or 'off') .. ')');
         msg('/bidcache price <n>         set the price the box opens at (0 forgets it)');
-        msg('/bidcache relearn           find the bid box and its item again');
+        msg('/bidcache relearn           find the bid box, its item and the sell box again');
         msg('/bidcache debug [on|off]    print menu names and what learning finds');
     end
 end);

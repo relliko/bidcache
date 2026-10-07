@@ -124,5 +124,39 @@ class LastBidTests(unittest.TestCase):
         self.assertEqual(list(keys(self.core.find(t, 1000)).values()), ['v|4'])
 
 
+class LastListingTests(unittest.TestCase):
+    def setUp(self):
+        self.lua, self.core = runtime()
+        self.match = self.lua.eval("function (c, last, id, stack) local p, w = c.match_sale(last, id, stack) return {p, w} end")
+
+    def last(self, id, stack, price):
+        t = self.lua.eval("{}")
+        t['id'], t['stack'], t['price'] = id, stack, price
+        return t
+
+    def m(self, last, id, stack=None):
+        r = self.match(self.core, last, id, stack)
+        return r[1], r[2]
+
+    def test_same_item_same_kind(self):
+        self.assertEqual(self.m(self.last(4096, False, 1500), 4096, False), (1500, False))
+        self.assertEqual(self.m(self.last(4096, True, 20000), 4096, True), (20000, False))
+
+    def test_other_item_wipes(self):
+        self.assertEqual(self.m(self.last(4096, False, 1500), 17, False), (None, True))
+
+    def test_other_kind_not_filled(self):
+        self.assertEqual(self.m(self.last(4096, False, 1500), 4096, True), (None, False))
+        self.assertEqual(self.m(self.last(4096, True, 20000), 4096, False), (None, False))
+
+    def test_single_price_never_used_when_kind_unknown(self):
+        self.assertEqual(self.m(self.last(4096, False, 1500), 4096), (None, False))
+        self.assertEqual(self.m(self.last(4096, True, 20000), 4096), (20000, False))
+
+    def test_unknown_item_or_nothing_remembered(self):
+        self.assertEqual(self.m(self.last(4096, False, 1500), None), (None, False))
+        self.assertEqual(self.m(None, 4096), (None, False))
+
+
 if __name__ == '__main__':
     unittest.main()
